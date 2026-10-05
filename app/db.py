@@ -24,6 +24,7 @@ from datetime import datetime
 import compare
 import compute
 import merge
+import analysis
 
 LEGACY_REASON = "历史版本缺少完整输入快照，不可回看、不可恢复"
 LEGACY_COMPARE_REASON = "历史版本缺少完整输入快照，无法比较"
@@ -354,6 +355,33 @@ def compare_versions(db_path, review_id, from_version, to_version):
         conn.close()
     result = compare.build_compare(from_data, to_data)
     result["review_id"] = review_id
+    return result
+
+
+def analyze_version(db_path, review_id, version):
+    """基于某版本不可变快照做只读冲突约束分析。
+
+    不重新保存、不改当前输入、版本号或定稿状态；版本不存在抛
+    VersionNotFound；旧库缺快照抛 LegacyVersion。
+    """
+    conn = connect(db_path)
+    try:
+        review = conn.execute("SELECT id FROM reviews WHERE id=?", (review_id,)).fetchone()
+        if review is None:
+            raise NotFound(review_id)
+        data = _version_snapshot(conn, review_id, version)
+    finally:
+        conn.close()
+    result = analysis.analyze_snapshot(data["input"])
+    result["review_id"] = review_id
+    result["version"] = version
+    result["title"] = data["title"]
+    result["state"] = data["state"]
+    result["kind"] = data["kind"]
+    result["snapshot_status"] = data["status"]
+    result["source_version"] = data.get("source_version")
+    result["source_review_id"] = data.get("source_review_id")
+    result["analysis_readonly"] = True
     return result
 
 

@@ -11,6 +11,7 @@
   POST   /api/reviews/{id}/finalize  定稿  {base_version}
   GET    /api/reviews/{id}/versions       可回看版本列表（含不可回看的旧库历史版本标记）
   GET    /api/reviews/{id}/versions/{v}   某版本回看：当时输入 + 推算依据 + 状态
+  GET    /api/reviews/{id}/versions/{v}/analysis 某版本冲突约束分析（只读，基于不可变快照）
   POST   /api/reviews/{id}/versions/{v}/restore  恢复为新草稿版本 {base_version}
   GET    /api/reviews/{id}/compare?from={v1}&to={v2}  两版本对照（只读，按事件持续身份配对）
   POST   /api/reviews/{id}/merge/preview              并入预览（只读）：{source_review_id, source_version, event_uids}
@@ -321,6 +322,19 @@ class Handler(BaseHTTPRequestHandler):
             if m and method == "GET":
                 rid, ver = int(m.group(1)), int(m.group(2))
                 return self._send_json(200, db.get_version(DB_PATH, rid, ver))
+
+            m = re.fullmatch(r"/api/reviews/(\d+)/versions/(\d+)/analysis", path)
+            if m and method == "GET":
+                rid, ver = int(m.group(1)), int(m.group(2))
+                try:
+                    return self._send_json(200, db.analyze_version(DB_PATH, rid, ver))
+                except db.LegacyVersion:
+                    return self._send_json(422, {
+                        "error": "历史版本缺少完整输入快照，无法分析冲突",
+                        "analyzable": False,
+                        "reviewable": False,
+                        "version": ver,
+                    })
 
             m = re.fullmatch(r"/api/reviews/(\d+)/versions/(\d+)/restore", path)
             if m and method == "POST":

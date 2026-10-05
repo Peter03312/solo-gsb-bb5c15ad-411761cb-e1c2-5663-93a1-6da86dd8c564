@@ -36,6 +36,15 @@
   - `window`：时间窗冲突，含**多路径上下界矛盾**——关系图本身无有向环，但最短等待
     沿一条路径推出的最早界与最长等待沿另一路径推出的最晚界无法同时满足。此时按
     受影响事件给出由输入和各关系推出的最早、最晚界及可读依据链，不再误报为关系成环。
+- **最小冲突约束分析（本轮新增）**：在任意**可回看版本**的冲突结果中可进入分析；
+  API 基于该版本不可变快照只读重建差分约束，定位一组足以单独造成冲突、且不可再
+  缩减的约束（minimal unsat set）：整组不可满足，移去其中任一条后该组可满足。
+  约束覆盖事件最早/最晚开始边界，以及每条“先于”关系的最短、最长等待（均含前项
+  持续时间）。同一版本重复查询返回稳定的约束 ID 与组 ID；无冲突返回空组。暂存
+  事件及其被跳过的关系不进入分析，并逐项说明排除原因。带时区约束换算为 UTC
+  绝对分钟判断，响应仍保留当地时间与 UTC 偏移；未带时区沿用朴素本地时间语义。
+  分析不保存任何内容，不改变当前输入、版本号或定稿状态；缺快照的旧版本返回
+  422 明确拒绝，版本/复盘不存在分别返回 404。
 - **暂存事件**：缺少时间范围（或持续分钟数）的事件可暂存，其关联的“先于”关系
   暂不参与推算，并在页面上标明原因；存在暂存事件时同样不得定稿。
 - **多人协作并发控制**：基于 `reviews.version` 的乐观锁。携带旧版本号的提交会被
@@ -121,6 +130,8 @@ python3 tests/test_api_timezone.py # 跨地区时区 HTTP API 端到端测试（
 python3 tests/test_merge.py    # 跨复盘并入规划单元测试（两端入选关系、字段保留、新身份、digest）
 python3 tests/test_merge_db.py # 并入持久化测试（预览只读、确认新草稿、409/400、冲突暂存不得定稿）
 python3 tests/test_merge_api.py # 并入 HTTP API 端到端测试（预览/确认、错误路径、时区偏移保留）
+python3 tests/test_analysis.py # 最小冲突约束单元测试（MUS、暂存排除、UTC 绝对分钟）
+python3 tests/test_analysis_api.py # 最小冲突约束 HTTP API 测试（只读稳定、404/422）
 ```
 
 > 跨地区时区依赖系统 IANA 时区库（Python 标准库 `zoneinfo` 读取
@@ -139,6 +150,7 @@ python3 tests/test_merge_api.py # 并入 HTTP API 端到端测试（预览/确�
 | POST | `/api/reviews/{id}/finalize` | 定稿 `{base_version}`；有冲突或暂存事件返回 400 |
 | GET | `/api/reviews/{id}/versions` | 版本列表（含回看/恢复标记；旧库无快照版本 `reviewable=false`） |
 | GET | `/api/reviews/{id}/versions/{v}` | 版本回看：当时标题/事件/关系输入 + 推算依据与状态；旧库无快照返回 422 |
+| GET | `/api/reviews/{id}/versions/{v}/analysis` | 基于版本不可变快照的最小冲突约束分析（只读）：无冲突返回空组；旧库无快照返回 422，版本不存在 404 |
 | POST | `/api/reviews/{id}/versions/{v}/restore` | 恢复为新草稿版本 `{base_version}`；过期返回 409，旧库无快照返回 422 |
 | GET | `/api/reviews/{id}/compare?from={v1}&to={v2}` | 两版本对照（只读）：须 `v1 < v2`；顺序无效 400、版本不存在 404、旧库无快照 422 |
 | POST | `/api/reviews/{id}/merge/preview` | 并入预览（只读）：`{source_review_id, source_version, event_uids}`；返回复制事件、两端均入选的关系、合并后推算结论与 `digest`；来源/目标相同 400、事件不存在 400、来源缺快照 422、复盘或版本不存在 404 |
@@ -176,6 +188,64 @@ curl -s -X POST http://localhost:8000/api/reviews/1/versions/3/restore \
 链，可直接**恢复为新草稿版本**）；旧库无快照版本只显示不可回看、不可恢复的原因。
 定稿产生的新版本会标注「已定稿」并沿用同一输入；由恢复产生的版本标注「恢复产生」并
 记录来源版本。
+
+### 最小冲突约束分析（本轮新增，HTTP 示例）
+
+对某个**可回看版本**只读分析其不可变输入快照，定位一组足以单独造成冲突、且不可再
+缩减的约束。每个事件最早/最晚开始边界是一条约束；每条“先于”关系的最短等待（含
+前项持续）和最长等待（含前项持续）也分别是约束。分析把这些约束写成差分边并检测
+正权环；返回的组满足：**整组不可满足，删除其中任意一条后该组可满足**。
+
+```bash
+# 冲突版本：返回最小冲突组
+curl -s http://localhost:8000/api/reviews/1/versions/3/analysis
+# {
+#   "review_id": 1, "version": 3, "status": "conflict",
+#   "snapshot_status": "conflict",
+#   "analysis_readonly": true,
+#   "groups": [{
+#     "id": "mus-4f2c8a91b0de", "type": "window",
+#     "minimal_unsatisfiable": true,
+#     "satisfiable_after_removing_any_constraint": true,
+#     "related_event_ids": ["id_1", "id_2"],
+#     "related_events": [{"id":"id_1","uid":"...","name":"A","timezone":null}],
+#     "constraint_ids": ["e0001:id_1:latest_start",
+#                        "e0002:id_2:earliest_start", "r0001:max_wait"],
+#     "constraints": [
+#       {"id": "e0001:id_1:latest_start", "kind": "event_boundary",
+#        "bound": "latest_start", "local_time": "2026-10-01T11:00",
+#        "time_basis": "naive_local", "timezone": null,
+#        "edge": {"from": "id_1", "to": "__time_origin__", "weight_minutes": -...}},
+#       {"id": "r0001:max_wait", "kind": "precedence", "bound": "max_wait",
+#        "predecessor_duration_minutes": 30, "max_gap_minutes": 10,
+#        "difference_minutes": 40,
+#        "edge": {"from": "id_2", "to": "id_1", "weight_minutes": -40},
+#        "message": "「A」先于「B」：前项持续 30 分钟、最长等待 10 分钟，后项开始至多只能晚 40 分钟"}
+#     ]
+#   }],
+#   "group": { ...同 groups[0]... },
+#   "excluded_draft_events": [],
+#   "excluded_skipped_relations": [],
+#   "exclusion_reason": "暂存事件缺少完整时间范围或持续时间；其关联关系随暂存事件一起跳过..."
+# }
+
+# 无冲突版本：空组（HTTP 200）
+curl -s http://localhost:8000/api/reviews/1/versions/1/analysis
+# {"status":"ok","groups":[],"group":null,...}
+
+# 错误路径
+# 版本不存在 → 404 {"error":"该版本不存在"}
+# 复盘不存在 → 404 {"error":"复盘不存在"}
+# 旧库版本缺少不可变快照 → 422 {"error":"历史版本缺少完整输入快照，无法分析冲突",
+#                              "analyzable":false,"reviewable":false,"version":1}
+```
+
+带时区约束的 `time_basis` 为 `utc_absolute`，包含 `absolute_minutes`（UTC 绝对
+分钟）、`timezone`、`utc_offset_minutes`，且 `local_time` 保留带偏移的当地时间；
+未带时区约束为 `naive_local`，不换算 UTC。暂存事件列在
+`excluded_draft_events`，因暂存或引用不存在事件而被跳过的关系列在
+`excluded_skipped_relations`，两者都带 `reason` 与 `excluded_constraint_ids`。
+页面上冲突卡片提供「分析最小冲突约束」按钮，版本回看弹窗与当前版本冲突结果均可进入。
 
 ### 版本对照（本轮新增，HTTP 示例）
 
@@ -449,8 +519,9 @@ curl -s -X PUT http://localhost:8000/api/reviews/1 \
 
 ```
 app/
-  server.py          HTTP 服务（标准库 http.server）、间隔设置校验、时区/偏移校验、对照与并入路由
-  db.py              SQLite 持久化、乐观锁、事件持续身份（uid）、启动时建表与老库迁移、并入事务
+  server.py          HTTP 服务（标准库 http.server）、间隔设置校验、时区/偏移校验、对照、并入与冲突分析路由
+  db.py              SQLite 持久化、乐观锁、事件持续身份（uid）、启动时建表与老库迁移、并入事务、只读版本分析
+  analysis.py        不可变快照的最小不可满足冲突约束分析（差分约束正权环与 MUS）
   merge.py           跨复盘并入的纯规划逻辑（复制选择、两端入选关系、合并推算与 digest；预览/确认共用）
   compute.py         时间窗推算与依据链生成（含间隔上下界传播、跨时区绝对分钟推算）
   tzutil.py          IANA 时区与带偏移当地时间校验（夏令时 gap/重复时刻）、按时区展示
@@ -465,5 +536,7 @@ tests/test_api_timezone.py 跨地区时区 HTTP API 端到端测试
 tests/test_merge.py    并入规划单元测试（两端入选关系、字段保留、新身份、digest 稳定性）
 tests/test_merge_db.py 并入持久化测试（预览只读、确认原子新草稿、409/400、冲突暂存不得定稿）
 tests/test_merge_api.py 并入 HTTP API 端到端测试（预览/确认、错误路径、时区偏移保留）
+tests/test_analysis.py 最小冲突约束单元测试（边界/等待/正环、缺一不可、暂存排除、时区）
+tests/test_analysis_api.py 最小冲突约束 HTTP API 测试（只读稳定、空组、404/422）
 Dockerfile / docker-compose.yml / .dockerignore
 ```

@@ -263,8 +263,9 @@ function chainHtml(chain) {
 
 function fmtTime(s) { return s ? escapeHtml(String(s).replace("T", " ")) : "—（暂存）"; }
 
-function buildResultHtml(res, evByKey) {
+function buildResultHtml(res, evByKey, analysisVersion) {
   // 生成推算结果各分区 HTML。evByKey: {窗口中使用的事件 id/key -> 事件输入}
+  // analysisVersion 存在时，冲突卡片可进入该不可变版本的约束分析。
   const nConf = res.conflicts.length;
   const nDraft = res.drafts.length;
   let summary;
@@ -278,8 +279,12 @@ function buildResultHtml(res, evByKey) {
 
   let conflicts = "";
   if (nConf > 0) {
-    conflicts = `<div class="section-title">冲突明细（输入已保留）</div>` + res.conflicts.map((c) => {
-      let html = `<div class="card conflict"><div class="msg">⚠ ${escapeHtml(c.message)}</div>`;
+    conflicts = `<div class="section-title">冲突明细（输入已保留）</div>` + res.conflicts.map((c, idx) => {
+      let html = `<div class="card conflict"><div class="conflict-head"><div class="msg">⚠ ${escapeHtml(c.message)}</div>`;
+      if (analysisVersion) {
+        html += `<button class="btn-analysis" data-analysis-version="${analysisVersion}" data-conflict-index="${idx}">分析最小冲突约束</button>`;
+      }
+      html += `</div>`;
       if (c.earliest_chain) {
         html += `<details open><summary>最早可行开始的依据链</summary>${chainHtml(c.earliest_chain)}</details>`;
         html += `<details open><summary>最晚可行开始的依据链</summary>${chainHtml(c.latest_chain)}</details>`;
@@ -338,7 +343,7 @@ function renderResults() {
   }
   const byKey = {};
   for (const e of state.current.events) byKey[String(e.id)] = e;
-  const parts = buildResultHtml(comp.result, byKey);
+  const parts = buildResultHtml(comp.result, byKey, state.current.review.version);
   for (const [sel, key] of slots) $(sel).innerHTML = parts[key];
 }
 
@@ -575,7 +580,7 @@ function renderVersionDetail(detail) {
   // 快照事件以 id_<旧行id> 为 key，推算结果窗口仍以旧行 id 为键
   const winIndex = {};
   for (const e of events) winIndex[String(e.key).replace(/^id_/, "")] = e;
-  const parts = buildResultHtml(detail.result, winIndex);
+  const parts = buildResultHtml(detail.result, winIndex, detail.version);
 
   return `<div class="section-title">当时输入（不可变快照）</div>` +
     `<table><thead><tr><th>事件名称</th><th>时区</th><th>最早开始</th><th>最晚开始</th>` +
@@ -607,6 +612,109 @@ async function restoreVersion(detail) {
   } catch (err) {
     handleSaveError(err);
   }
+}
+
+/* ------------------------------------------------------------ 冲突约束分析 */
+
+async function openVersionAnalysis(version) {
+  if (!state.current) return;
+  try {
+    const data = await api(
+      "GET", `/api/reviews/${state.current.review.id}/versions/${version}/analysis`);
+    hideBanner();
+    renderAnalysisModal(data);
+  } catch (err) {
+    showBanner("⚠ 冲突约束分析失败：" + escapeHtml(err.message || "未知错误"));
+  }
+}
+
+function closeAnalysisModal() { $("#analysis-modal").classList.add("hidden"); }
+
+function formatOffset(minutes) {
+  if (minutes === null || minutes === undefined) return "—";
+  const sign = minutes >= 0 ? "+" : "-";
+  const abs = Math.abs(minutes);
+  return `UTC${sign}${String(Math.floor(abs / 60)).padStart(2, "0")}:` +
+    `${String(abs % 60).padStart(2, "0")}`;
+}
+
+function fmtBasis(c) {
+  if (c.time_basis === "utc_absolute") {
+    return `绝对 UTC 分钟 ${c.absolute_minutes}；当地时间 ${fmtVal(c.local_time)}` +
+      `，偏移 ${formatOffset(c.utc_offset_minutes)}（${c.timezone || ""}）`;
+  }
+  return "未带时区，沿用朴素当地时间语义";
+}
+
+function renderAnalysisExclusions(data) {
+  const drafts = data.excluded_draft_events.length
+    ? data.excluded_draft_events.map((d) =>
+      `<div class="card draft"><h3>暂存事件「${escapeHtml(d.name)}」</h3>` +
+      `<div class="reason">${escapeHtml(d.reason)}</div></div>`).join("")
+    : `<div class="hint">无暂存事件。</div>`;
+  const skipped = data.excluded_skipped_relations.length
+    ? data.excluded_skipped_relations.map((r) => {
+      const a = data.events.find((e) => e.id === r.predecessor_event_id);
+      const b = data.events.find((e) => e.id === r.successor_event_id);
+      const an = a ? a.name : r.predecessor_event_id;
+      const bn = b ? b.name : r.successor_event_id;
+      return `<div class="card draft"><div class="reason">「${escapeHtml(an)}」先于` +
+        `「${escapeHtml(bn)}」：${escapeHtml(r.reason)}</div></div>`;
+    }).join("")
+    : `<div class="hint">无被跳过的关系。</div>`;
+  return `<div class="section-title">不参与分析的输入及原因</div>${drafts}${skipped}`;
+}
+
+function renderAnalysisModal(data) {
+  $("#am-title").textContent = `冲突约束分析：v${data.version} ${data.title}`;
+  $("#am-meta").textContent =
+    "基于该版本不可变输入快照，只读分析；不改变当前输入、版本号或定稿状态。" +
+    "带时区约束按 UTC 绝对分钟判定，展示保留当地时间和偏移；未带时区沿用朴素当地时间。";
+
+  if (!data.groups.length) {
+    $("#am-body").innerHTML =
+      `<div class="summary ok">该快照当前没有冲突，返回空冲突组。</div>` +
+      renderAnalysisExclusions(data);
+    $("#analysis-modal").classList.remove("hidden");
+    return;
+  }
+
+  const nameById = {};
+  for (const e of data.events) nameById[e.id] = e.name;
+  const body = data.groups.map((g, idx) => {
+    const related = g.related_event_ids.map((id) =>
+      `<span>「${escapeHtml(nameById[id] || id)}」</span>`).join("");
+    const constraints = g.constraints.map((c, i) => {
+      let relMeta = "";
+      if (c.relation) {
+        relMeta = `<div>关系：「${escapeHtml(c.relation.predecessor_name)}」先于` +
+          `「${escapeHtml(c.relation.successor_name)}」；前项持续 ${c.predecessor_duration_minutes} 分钟；` +
+          `最短等待 ${c.relation.min_gap_minutes} 分钟；最长等待 ` +
+          `${c.relation.max_gap_minutes === null || c.relation.max_gap_minutes === undefined
+            ? "不限" : c.relation.max_gap_minutes + " 分钟"}</div>`;
+      }
+      return `<div class="card analysis-constraint">
+        <h3>${i + 1}. ${escapeHtml(c.message)}</h3>
+        <div class="analysis-meta">
+          <div>约束 ID：${escapeHtml(c.id)}；类型：${escapeHtml(c.type)}</div>
+          <div>${escapeHtml(fmtBasis(c))}</div>
+          ${relMeta}
+          <div>差分边：${escapeHtml(c.edge.from)} → ${escapeHtml(c.edge.to)}，权重 ${c.edge.weight_minutes} 分钟</div>
+        </div>
+      </div>`;
+    }).join("");
+    return `<div class="card analysis-mus">
+      <h3>冲突组 ${idx + 1}（${escapeHtml(g.type)}）<span class="badge err">不可再缩减</span></h3>
+      <div class="msg">${escapeHtml(g.message)}</div>
+      <div class="hint">整组不可满足；移去其中任意一条约束后，该组可满足。</div>
+      <div class="analysis-events">${related}</div>
+      <div class="hint">约束数量：${g.constraints.length}；稳定组 ID：${escapeHtml(g.id)}</div>
+      ${constraints}
+    </div>`;
+  }).join("");
+
+  $("#am-body").innerHTML = body + renderAnalysisExclusions(data);
+  $("#analysis-modal").classList.remove("hidden");
 }
 
 /* ------------------------------------------------------------ 版本对照 */
@@ -1074,6 +1182,16 @@ $("#compare-modal").addEventListener("click", (e) => {
 $("#btn-vm-close").addEventListener("click", closeVersionModal);
 $("#version-modal").addEventListener("click", (e) => {
   if (e.target.id === "version-modal") closeVersionModal();
+});
+document.body.addEventListener("click", (e) => {
+  const btn = e.target.closest(".btn-analysis");
+  if (!btn) return;
+  if (!$("#version-modal").classList.contains("hidden")) closeVersionModal();
+  openVersionAnalysis(parseInt(btn.dataset.analysisVersion, 10));
+});
+$("#btn-am-close").addEventListener("click", closeAnalysisModal);
+$("#analysis-modal").addEventListener("click", (e) => {
+  if (e.target.id === "analysis-modal") closeAnalysisModal();
 });
 
 $("#review-select").addEventListener("change", (e) => openReview(e.target.value));
