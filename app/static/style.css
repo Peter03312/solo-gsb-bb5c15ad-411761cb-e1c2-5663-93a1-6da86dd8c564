@@ -179,3 +179,13 @@ table.cmp th, table.cmp td { padding: 4px 6px; }
 .card.diff-add { border-color: var(--ok); }
 .card.diff-del { border-color: var(--err); }
 .card.diff-rename { border-color: var(--warn); }
+
+/* 冲突最小约束组分析 */
+.diagnose-entry { margin: 6px 0; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.btn-diagnose { padding: 4px 10px; }
+.dg-group { margin-bottom: 12px; }
+.dg-kind { color: var(--warn); }
+.dg-constraints { margin: 8px 0; padding-left: 20px; }
+.dg-constraints li { margin-bottom: 6px; }
+.dg-type { display: inline-block; font-size: 11px; color: var(--accent); margin-bottom: 2px; }
+.dg-time { font-family: ui-monospace, monospace; font-size: 12px; color: var(--accent); white-space: nowrap; }

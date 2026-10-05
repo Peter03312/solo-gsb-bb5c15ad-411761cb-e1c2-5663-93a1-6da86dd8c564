@@ -77,6 +77,23 @@
   - 并入产生的新版本在版本列表标注「并入产生」并记录来源复盘与来源版本，
     可正常回看、恢复、对照。网页在「历史版本」面板提供来源选择、事件勾选、
     预览与确认的完整操作。
+- **冲突最小约束组分析（本轮新增）**：在某个**可回看版本**的冲突结果中，
+  一键定位一组（或多组相互独立的）**不可再缩减的冲突输入**：按该版本的
+  **不可变快照**把每个非暂存事件的最早/最晚开始边界与每条“先于”关系的
+  最短、最长等待（**均含前项持续时间**）建成差分约束图，返回的每组
+  **整组不可满足、移去其中任一条后该组即可满足**，并给出关联事件、
+  矛盾分钟数与每条约束的可读说明（按成因分为 `invalid_range` / `cycle` /
+  `window`）。
+  - **暂存事件**及其关联关系、引用缺失的关系**不参与分析**，响应中分别
+    列出排除原因；**无冲突返回空组**。
+  - 带时区约束先折算为 **UTC 绝对分钟**判定（与事件所在时区、当日夏令时
+    无关），展示时**保留各事件的当地时间与 UTC 偏移**；未带时区沿用朴素
+    本地时间语义。夏令时回退的两个同面盘时刻按偏移对应不同绝对分钟。
+  - 分析**只读**：不改输入、版本号与定稿状态，不写任何记录；同一版本
+    重复查询结果稳定（边按快照顺序固定编号，环按最小编号旋转确定起点）。
+  - 旧库**缺快照的历史版本明确拒绝（HTTP 422）**，复盘或版本不存在报
+    **404**；网页在当前结果区与版本回看弹窗的冲突卡片上提供入口。
+  对应接口：`GET /api/reviews/{id}/versions/{v}/diagnosis`。
 
 ## 容器启动
 
@@ -121,6 +138,8 @@ python3 tests/test_api_timezone.py # 跨地区时区 HTTP API 端到端测试（
 python3 tests/test_merge.py    # 跨复盘并入规划单元测试（两端入选关系、字段保留、新身份、digest）
 python3 tests/test_merge_db.py # 并入持久化测试（预览只读、确认新草稿、409/400、冲突暂存不得定稿）
 python3 tests/test_merge_api.py # 并入 HTTP API 端到端测试（预览/确认、错误路径、时区偏移保留）
+python3 tests/test_diagnose.py  # 冲突最小约束组分析单元测试（差分约束负环、极小性、时区绝对分钟、排除项、稳定性）
+python3 tests/test_api_diagnose.py # 冲突分析 HTTP API 端到端测试（极小组、空组、404/422、只读、暂存排除）
 ```
 
 > 跨地区时区依赖系统 IANA 时区库（Python 标准库 `zoneinfo` 读取
@@ -140,6 +159,7 @@ python3 tests/test_merge_api.py # 并入 HTTP API 端到端测试（预览/确�
 | GET | `/api/reviews/{id}/versions` | 版本列表（含回看/恢复标记；旧库无快照版本 `reviewable=false`） |
 | GET | `/api/reviews/{id}/versions/{v}` | 版本回看：当时标题/事件/关系输入 + 推算依据与状态；旧库无快照返回 422 |
 | POST | `/api/reviews/{id}/versions/{v}/restore` | 恢复为新草稿版本 `{base_version}`；过期返回 409，旧库无快照返回 422 |
+| GET | `/api/reviews/{id}/versions/{v}/diagnosis` | 该版本冲突的最小不可满足约束组分析（只读，按不可变快照）：整组不可满足、去掉任一条可满足；无冲突 `groups` 为空；版本不存在 404、旧库无快照 422 |
 | GET | `/api/reviews/{id}/compare?from={v1}&to={v2}` | 两版本对照（只读）：须 `v1 < v2`；顺序无效 400、版本不存在 404、旧库无快照 422 |
 | POST | `/api/reviews/{id}/merge/preview` | 并入预览（只读）：`{source_review_id, source_version, event_uids}`；返回复制事件、两端均入选的关系、合并后推算结论与 `digest`；来源/目标相同 400、事件不存在 400、来源缺快照 422、复盘或版本不存在 404 |
 | POST | `/api/reviews/{id}/merge/confirm` | 确认并入，一次性另存为目标新草稿版本：`{source_review_id, source_version, event_uids, base_version, digest}`；目标过期 409、digest 与预览不符 400 |
@@ -229,6 +249,84 @@ curl -s 'http://localhost:8000/api/reviews/1/compare?from=1&to=2'   # v1 为旧�
 页面上在「历史版本」面板上方的对照栏选择较早/较晚版本后点「对照这两个版本」即可
 查看同样内容（缺快照的旧版本在下拉中禁选）；对照弹窗分组展示新增/删除/改名事件、
 输入与推算窗口变化表、关系间隔变化、暂存状态变化与两版冲突对比。
+
+### 冲突最小约束组分析（本轮新增，HTTP 示例）
+
+查看某个**可回看版本**的冲突时，调用只读接口按该版本**不可变快照**定位
+**不可再缩减的冲突约束组**：每组中的约束来自事件的最早/最晚开始边界与
+“先于”关系的最短/最长等待（**均含前项持续时间**），整组不可满足，
+**移去其中任一条后该组即可满足**。同一版本重复查询结果稳定。
+
+```bash
+# 分析 v3（只读：不改输入、版本号与定稿状态）
+curl -s http://localhost:8000/api/reviews/1/versions/3/diagnosis
+# {
+#   "review_id": 1, "version": 3, "kind": "save", "state": "draft",
+#   "title": "...", "status": "conflict", "read_only": true,
+#   "analysis": {
+#     "status": "conflict",
+#     "groups": [
+#       {
+#         "index": 1, "kind": "window",           # invalid_range | cycle | window
+#         "slack_minutes": -40,                    # 负环总权（负数=矛盾分钟数）
+#         "contradiction_minutes": 40,
+#         "message": "…最短等待路径抬高的最早界…晚于…最长等待路径压低的最晚界…",
+#         "constraints": [
+#           {"id": "id_1.rel0.min", "type": "min_wait",
+#            "type_label": "最短等待（含前项持续）",
+#            "predecessor": {"uid": "...", "name": "A", "timezone": null},
+#            "successor":   {"uid": "...", "name": "B", "timezone": null},
+#            "predecessor_duration_minutes": 0, "gap_minutes": 60,
+#            "delta_minutes": 60,                  # = 前项持续 + 等待
+#            "min_gap_minutes": 60, "max_gap_minutes": null,
+#            "text": "「A」先于「B」：前项「A」持续 0 分钟、最短等待 60 分钟，"
+#                  + "故「B」开始 ≥「A」开始之后 60 分钟"},
+#           {"id": "id_1.rel2.max", "type": "max_wait", ...},
+#           {"id": "id_3.rel3.max", "type": "max_wait", ...},
+#           {"id": "id_2.rel1.min", "type": "min_wait", ...}],
+#         "events": [{"uid": "...", "name": "A", "timezone": null}, ...]}],
+#     "drafts": [],                # 被排除的暂存事件（不参与分析）及原因
+#     "excluded_relations": []}}   # 被跳过的“先于”关系及原因
+```
+
+约束的四种 `type`：
+
+| type | 含义 | 关键字段 |
+|---|---|---|
+| `earliest_bound` | 事件最早开始边界 `x ≥ E` | `event`、`local_time`（保留当地时间与偏移）、`absolute_minutes`（UTC 分钟） |
+| `latest_bound` | 事件最晚开始边界 `x ≤ L` | 同上 |
+| `min_wait` | 后项开始 ≥ 前项开始 + 前项持续 + 最短等待 | `predecessor_duration_minutes`、`gap_minutes`、`delta_minutes` |
+| `max_wait` | 后项开始 ≤ 前项开始 + 前项持续 + 最长等待 | 同上 |
+
+```bash
+# 1) 无冲突的版本：groups 为空（暂存事件/跳过关系仍在 drafts / excluded_relations 说明）
+curl -s http://localhost:8000/api/reviews/1/versions/4/diagnosis
+# {"analysis": {"status": "ok", "groups": [], "drafts": [...], "excluded_relations": [...]}}
+
+# 2) 输入范围自相矛盾：两条边界各一条，kind="invalid_range"
+#    {"kind": "invalid_range", "constraints": [最早边界…, 最晚边界…]}
+
+# 3) “先于”关系成环：环上全部为 min_wait，kind="cycle"
+
+# 4) 错误路径
+curl -s http://localhost:8000/api/reviews/999/versions/3/diagnosis
+# 404 {"error": "复盘不存在"}
+curl -s http://localhost:8000/api/reviews/1/versions/99/diagnosis
+# 404 {"error": "该版本不存在"}
+curl -s http://localhost:8000/api/reviews/1/versions/1/diagnosis   # v1 为旧库无快照版本
+# 422 {"error": "该版本缺少完整输入快照，无法分析冲突约束", "analyzable": false, "version": 1}
+```
+
+带时区版本的边界约束：`local_time` 保留输入快照中的**当地时间与 UTC 偏移**
+（并带事件 `timezone`），判定一律使用 `absolute_minutes`（UTC 绝对分钟），
+因此跨时区、夏令时回退的两个同面盘时刻都能正确区分；约束等待量
+（`delta_minutes`）本就是绝对分钟。未带时区事件没有偏移字段，沿用朴素
+本地时间语义。
+
+页面上两个入口：当前「推算结果 → 冲突明细」顶部的
+**「分析该版本的最小冲突约束组（只读）」**按钮，以及任意**版本回看**弹窗
+冲突分区中的同一按钮；点击弹出分析弹窗，分组展示每组约束、关联事件、
+矛盾分钟数，以及不参与分析的暂存事件与被跳过关系（含原因）。
 
 ### 跨复盘并入历史事件链（本轮新增，HTTP 示例）
 
@@ -453,6 +551,7 @@ app/
   db.py              SQLite 持久化、乐观锁、事件持续身份（uid）、启动时建表与老库迁移、并入事务
   merge.py           跨复盘并入的纯规划逻辑（复制选择、两端入选关系、合并推算与 digest；预览/确认共用）
   compute.py         时间窗推算与依据链生成（含间隔上下界传播、跨时区绝对分钟推算）
+  diagnose.py        版本冲突最小不可满足约束组分析（差分约束图负环、删除式收缩保证极小性，只读）
   tzutil.py          IANA 时区与带偏移当地时间校验（夏令时 gap/重复时刻）、按时区展示
   compare.py         版本对照：跨版本按 uid 配对与差值计算（纯函数，只读）
   static/            浏览器单页界面（原生 HTML/JS/CSS）
@@ -465,5 +564,7 @@ tests/test_api_timezone.py 跨地区时区 HTTP API 端到端测试
 tests/test_merge.py    并入规划单元测试（两端入选关系、字段保留、新身份、digest 稳定性）
 tests/test_merge_db.py 并入持久化测试（预览只读、确认原子新草稿、409/400、冲突暂存不得定稿）
 tests/test_merge_api.py 并入 HTTP API 端到端测试（预览/确认、错误路径、时区偏移保留）
+tests/test_diagnose.py 冲突最小约束组分析单元测试（负环、极小性、时区绝对分钟、排除项、稳定性）
+tests/test_api_diagnose.py 冲突分析 HTTP API 端到端测试（极小组、空组、404/422、只读、暂存排除）
 Dockerfile / docker-compose.yml / .dockerignore
 ```

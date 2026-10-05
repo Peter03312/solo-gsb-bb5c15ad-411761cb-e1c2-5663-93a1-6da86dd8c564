@@ -263,8 +263,10 @@ function chainHtml(chain) {
 
 function fmtTime(s) { return s ? escapeHtml(String(s).replace("T", " ")) : "—（暂存）"; }
 
-function buildResultHtml(res, evByKey) {
+function buildResultHtml(res, evByKey, analysisVersion) {
   // 生成推算结果各分区 HTML。evByKey: {窗口中使用的事件 id/key -> 事件输入}
+  // analysisVersion 为该结果对应的可回看版本号时，冲突分区提供“最小冲突约束
+  // 组分析”入口（当前版本与历史回看均可进入；并入预览不传，不提供入口）。
   const nConf = res.conflicts.length;
   const nDraft = res.drafts.length;
   let summary;
@@ -278,7 +280,13 @@ function buildResultHtml(res, evByKey) {
 
   let conflicts = "";
   if (nConf > 0) {
-    conflicts = `<div class="section-title">冲突明细（输入已保留）</div>` + res.conflicts.map((c) => {
+    let entry = "";
+    if (analysisVersion) {
+      entry = `<div class="diagnose-entry"><button class="btn-diagnose" data-version="${analysisVersion}">` +
+        `🔎 分析该版本的最小冲突约束组（只读）</button>` +
+        `<span class="hint">按该版本不可变快照定位“去掉任一条即可解”的最小冲突输入</span></div>`;
+    }
+    conflicts = `<div class="section-title">冲突明细（输入已保留）</div>` + entry + res.conflicts.map((c) => {
       let html = `<div class="card conflict"><div class="msg">⚠ ${escapeHtml(c.message)}</div>`;
       if (c.earliest_chain) {
         html += `<details open><summary>最早可行开始的依据链</summary>${chainHtml(c.earliest_chain)}</details>`;
@@ -338,7 +346,7 @@ function renderResults() {
   }
   const byKey = {};
   for (const e of state.current.events) byKey[String(e.id)] = e;
-  const parts = buildResultHtml(comp.result, byKey);
+  const parts = buildResultHtml(comp.result, byKey, state.current.review.version);
   for (const [sel, key] of slots) $(sel).innerHTML = parts[key];
 }
 
@@ -575,7 +583,7 @@ function renderVersionDetail(detail) {
   // 快照事件以 id_<旧行id> 为 key，推算结果窗口仍以旧行 id 为键
   const winIndex = {};
   for (const e of events) winIndex[String(e.key).replace(/^id_/, "")] = e;
-  const parts = buildResultHtml(detail.result, winIndex);
+  const parts = buildResultHtml(detail.result, winIndex, detail.version);
 
   return `<div class="section-title">当时输入（不可变快照）</div>` +
     `<table><thead><tr><th>事件名称</th><th>时区</th><th>最早开始</th><th>最晚开始</th>` +
@@ -1028,6 +1036,85 @@ async function confirmMerge() {
   }
 }
 
+/* ------------------------------------------------------------ 冲突最小约束分析 */
+
+async function openDiagnosis(version) {
+  if (!state.current) return;
+  const rid = state.current.review.id;
+  let data;
+  try {
+    data = await api("GET", `/api/reviews/${rid}/versions/${version}/diagnosis`);
+  } catch (err) {
+    // 版本不存在(404)、旧库缺快照(422)等：明确提示，不做任何修改
+    showBanner("⚠ 冲突分析失败：" + escapeHtml(err.message || "未知错误"));
+    return;
+  }
+  renderDiagnosisModal(data);
+}
+
+function closeDiagnosisModal() { $("#diagnosis-modal").classList.add("hidden"); }
+
+function dgTime(c) {
+  if (!c.local_time) return "";
+  const tz = c.event && c.event.timezone ? `（${c.event.timezone}）` : "";
+  return `<span class="dg-time">${escapeHtml(String(c.local_time).replace("T", " "))}${escapeHtml(tz)}</span>`;
+}
+
+function renderDiagnosisModal(data) {
+  const a = data.analysis;
+  $("#dg-title").textContent = `冲突最小约束组分析：v${data.version} ${data.title}`;
+  $("#dg-meta").textContent =
+    `只读分析，基于该版本不可变快照，不更改输入、版本号与定稿状态。推算状态：` +
+    `${a.status === "conflict" ? "冲突" : "通过"}　|　同一版本重复查询结果一致。` +
+    `　|　分析时间所依据的推算：${(data.computed_at || "").replace("T", " ")}`;
+
+  let body = "";
+  if (!a.groups.length) {
+    body += `<div class="summary ok">该版本不存在冲突约束：最小冲突约束组为空。</div>`;
+  } else {
+    body += `<div class="summary err">共定位到 ${a.groups.length} 组不可再缩减的冲突约束。` +
+      `每组整组不可满足；移去其中任意一条后，该组即可满足。</div>`;
+    body += a.groups.map((g) => {
+      const kindLabel = { invalid_range: "输入范围矛盾", cycle: "“先于”关系成环", window: "时间窗/多路径矛盾" }[g.kind] || g.kind;
+      let html = `<div class="card dg-group">` +
+        `<h3>第 ${g.index} 组 · <span class="dg-kind">${escapeHtml(kindLabel)}</span>` +
+        ` <span class="hint">环上矛盾量 ${g.contradiction_minutes} 分钟</span></h3>` +
+        `<div class="msg">⚠ ${escapeHtml(g.message)}</div>` +
+        `<div class="hint">关联事件：${g.events.map((e) =>
+          `「${escapeHtml(e.name || "?")}」` +
+          (e.timezone ? ` <span class="tz-tag">${escapeHtml(e.timezone)}</span>` : "")).join("、")}</div>` +
+        `<ol class="dg-constraints">` +
+        g.constraints.map((c) => {
+          const gapExtra = c.type === "earliest_bound" || c.type === "latest_bound"
+            ? dgTime(c)
+            : `<span class="hint">约束增量 ${c.delta_minutes} 分钟（前项持续 ${c.predecessor_duration_minutes}` +
+              `${c.type === "min_wait" && c.gap_minutes ? ` + 最短等待 ${c.gap_minutes}` : ""}` +
+              `${c.type === "max_wait" ? ` + 最长等待 ${c.gap_minutes}` : ""}）</span>`;
+          return `<li><span class="dg-type">${escapeHtml(c.type_label)}</span>` +
+            `<div>${escapeHtml(c.text)} ${gapExtra}</div></li>`;
+        }).join("") + `</ol>` +
+        `<div class="hint">极小性：整组不可满足；删除以上任意一条后，该组约束均可满足。</div>` +
+        `</div>`;
+      return html;
+    }).join("");
+  }
+
+  if (a.drafts && a.drafts.length) {
+    body += `<div class="section-title">不参与分析的暂存事件（${a.drafts.length}）</div>` +
+      a.drafts.map((d) => `<div class="card draft"><h3>「${escapeHtml(d.name || "?")}」</h3>` +
+        `<div class="reason">${escapeHtml(d.reason)}</div></div>`).join("");
+  }
+  if (a.excluded_relations && a.excluded_relations.length) {
+    body += `<div class="section-title">不参与分析的“先于”关系（${a.excluded_relations.length}）</div>` +
+      a.excluded_relations.map((r) => `<div class="card draft"><div class="reason">` +
+        `「${escapeHtml(r.predecessor.name || "?")}」先于「${escapeHtml(r.successor.name || "?")}」` +
+        `：${escapeHtml(r.reason)}</div></div>`).join("");
+  }
+
+  $("#dg-body").innerHTML = body;
+  $("#diagnosis-modal").classList.remove("hidden");
+}
+
 /* ---------------------------------------------------------------- 事件绑定 */
 
 $("#btn-new").addEventListener("click", async () => {
@@ -1074,6 +1161,16 @@ $("#compare-modal").addEventListener("click", (e) => {
 $("#btn-vm-close").addEventListener("click", closeVersionModal);
 $("#version-modal").addEventListener("click", (e) => {
   if (e.target.id === "version-modal") closeVersionModal();
+});
+$("#btn-dg-close").addEventListener("click", closeDiagnosisModal);
+$("#diagnosis-modal").addEventListener("click", (e) => {
+  if (e.target.id === "diagnosis-modal") closeDiagnosisModal();
+});
+/* 冲突结果中的“最小冲突约束组分析”入口（当前结果区与版本回看弹窗内共用，
+   按钮用 data-version 指向要分析的可回看版本） */
+document.addEventListener("click", (e) => {
+  const btn = e.target.closest(".btn-diagnose");
+  if (btn) openDiagnosis(parseInt(btn.dataset.version, 10));
 });
 
 $("#review-select").addEventListener("change", (e) => openReview(e.target.value));

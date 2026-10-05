@@ -23,11 +23,13 @@ from datetime import datetime
 
 import compare
 import compute
+import diagnose
 import merge
 
 LEGACY_REASON = "历史版本缺少完整输入快照，不可回看、不可恢复"
 LEGACY_COMPARE_REASON = "历史版本缺少完整输入快照，无法比较"
 LEGACY_MERGE_REASON = "来源版本缺少完整输入快照，不可并入"
+LEGACY_DIAGNOSE_REASON = "该版本缺少完整输入快照，无法分析冲突约束"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS reviews (
@@ -355,6 +357,35 @@ def compare_versions(db_path, review_id, from_version, to_version):
     result = compare.build_compare(from_data, to_data)
     result["review_id"] = review_id
     return result
+
+
+def analyze_version(db_path, review_id, version):
+    """对某可回看版本的不可变快照做最小不可满足冲突约束分析（只读）。
+
+    不改当前输入、版本号与定稿状态，也不写任何记录：只读取该版本的
+    snapshots + computations，由 diagnose 纯函数重算。
+    版本不存在抛 VersionNotFound；旧库缺少输入快照的版本抛 LegacyVersion。
+    """
+    conn = connect(db_path)
+    try:
+        review = conn.execute("SELECT id FROM reviews WHERE id=?", (review_id,)).fetchone()
+        if review is None:
+            raise NotFound(review_id)
+        data = _version_snapshot(conn, review_id, version)
+    finally:
+        conn.close()
+    analysis = diagnose.analyze_snapshot(data)
+    return {
+        "review_id": review_id,
+        "version": version,
+        "kind": data["kind"],
+        "state": data["state"],
+        "title": data["title"],
+        "status": data["status"],
+        "computed_at": data["computed_at"],
+        "read_only": True,
+        "analysis": analysis,
+    }
 
 
 # ---------------------------------------------------------------------- 写入
